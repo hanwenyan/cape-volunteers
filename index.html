@@ -172,6 +172,58 @@
       font-weight: 700;
     }
 
+    .header-sync-btn {
+      margin-top: 3px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 7px 2px 0;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--cape-sky);
+      line-height: 1.2;
+      transition: opacity 0.15s ease;
+    }
+
+    .header-sync-btn:active {
+      opacity: 0.72;
+    }
+
+    .sync-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #94A3B8;
+      flex-shrink: 0;
+    }
+
+    .sync-dot.synced {
+      background: #34D399;
+      box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.25);
+    }
+
+    .sync-dot.syncing {
+      background: var(--cape-sky);
+    }
+
+    .sync-dot.error {
+      background: #FBBF24;
+    }
+
+    .sync-spin-icon {
+      opacity: 0.85;
+      flex-shrink: 0;
+    }
+
+    .header-sync-btn.is-syncing .sync-spin-icon {
+      animation: spinSync 0.9s linear infinite;
+    }
+
+    @keyframes spinSync {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
     /* Sticky Bottom Navigation Bar */
     .bottom-nav {
       position: fixed;
@@ -754,6 +806,15 @@
       <div class="header-row">
         <div>
           <h1 class="brand-title">Mrs. White’s Volunteers</h1>
+          <button type="button" class="header-sync-btn" id="headerSyncBtn" aria-label="Sync schedule with Google Sheet">
+            <span class="sync-dot" id="headerSyncDot"></span>
+            <span id="headerSyncText">Loading schedule…</span>
+            <svg class="sync-spin-icon" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+            </svg>
+          </button>
         </div>
         <button type="button" class="identity-pill-btn unselected" id="identityBtn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"
@@ -843,7 +904,10 @@
       mode: "mine", // "mine" | "open" | "schedule"
       selectedMonth: "Nov 2026",
       selectedParent: localStorage.getItem(STORAGE_KEYS.PARENT_NAME) || "",
-      showPast: false
+      showPast: false,
+      syncStatus: "idle", // "idle" | "syncing" | "synced" | "error"
+      lastSyncTimestamp: 0,
+      syncInFlight: false
     };
 
     function getApiUrl() {
@@ -897,28 +961,77 @@
       bindEvents();
 
       if (getApiUrl()) {
-        syncFromServer(false);
+        syncFromServer(false, true);
+      } else {
+        renderSyncStatus();
       }
     }
 
-    async function syncFromServer(showFeedback) {
+    function formatSyncTime(ts) {
+      if (!ts) return "";
+      try {
+        return new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function renderSyncStatus() {
+      const btn = document.getElementById("headerSyncBtn");
+      const dot = document.getElementById("headerSyncDot");
+      const txt = document.getElementById("headerSyncText");
+      if (!btn || !dot || !txt) return;
+
+      btn.classList.toggle("is-syncing", state.syncStatus === "syncing");
+      dot.className = "sync-dot" + (state.syncStatus !== "idle" ? ` ${state.syncStatus}` : "");
+
+      if (!getApiUrl()) {
+        txt.textContent = "Snapshot only · Tap to connect";
+      } else if (state.syncStatus === "syncing") {
+        txt.textContent = "Syncing with Google Sheet…";
+      } else if (state.syncStatus === "synced" && state.lastSyncTimestamp) {
+        txt.textContent = `Live · Synced ${formatSyncTime(state.lastSyncTimestamp)}`;
+      } else if (state.syncStatus === "error") {
+        txt.textContent = "Offline (cached) · Tap to retry";
+      } else {
+        txt.textContent = "Auto-syncs with Google Sheet";
+      }
+    }
+
+    async function syncFromServer(showFeedback, forceNoCache = showFeedback) {
       const apiUrl = getApiUrl();
       if (!apiUrl) {
         if (showFeedback) openApiConfigSheet();
+        renderSyncStatus();
         return;
       }
+      if (state.syncInFlight) return;
+      state.syncInFlight = true;
+      state.syncStatus = "syncing";
+      renderSyncStatus();
+
       try {
         const sep = apiUrl.includes("?") ? "&" : "?";
-        const res = await fetch(`${apiUrl}${sep}action=all${showFeedback ? "&nocache=1" : ""}`, { redirect: "follow" });
+        const res = await fetch(`${apiUrl}${sep}action=all${forceNoCache ? "&nocache=1" : ""}`, { redirect: "follow" });
         const json = await res.json();
         if (json && json.ok) {
           state.data = json;
+          state.syncStatus = "synced";
+          state.lastSyncTimestamp = Date.now();
           localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(json));
           renderAll();
           if (showFeedback) showToast("Synced with Google Sheet");
+        } else {
+          state.syncStatus = "error";
+          renderSyncStatus();
+          if (showFeedback) showToast("Could not refresh schedule", true);
         }
       } catch (err) {
+        state.syncStatus = "error";
+        renderSyncStatus();
         if (showFeedback) showToast("Could not reach server — using cached schedule", true);
+      } finally {
+        state.syncInFlight = false;
       }
     }
 
@@ -1003,6 +1116,8 @@
 
     function renderAll() {
       if (!state.data) return;
+
+      renderSyncStatus();
 
       // Update header identity pill
       const idBtn = document.getElementById("identityBtn");
@@ -1647,6 +1762,8 @@
           if (json && json.ok && json.month) {
             const idx = state.data.months.findIndex(x => x.tabName === json.month.tabName);
             if (idx !== -1) state.data.months[idx] = json.month;
+            state.syncStatus = "synced";
+            state.lastSyncTimestamp = Date.now();
             localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
             renderAll();
             showToast("Saved to Google Sheet");
@@ -1694,6 +1811,8 @@
           if (idx !== -1) state.data.months[idx] = result.month;
           localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
         }
+        state.syncStatus = "synced";
+        state.lastSyncTimestamp = Date.now();
         renderAll();
         showToast("Saved to Google Sheet");
       } catch (err) {
@@ -1917,6 +2036,7 @@
 
     function bindEvents() {
       document.getElementById("identityBtn").addEventListener("click", openIdentitySheet);
+      document.getElementById("headerSyncBtn").addEventListener("click", () => syncFromServer(true, true));
 
       document.querySelectorAll("[data-filter-mode]").forEach(btn => {
         btn.addEventListener("click", () => {
@@ -1925,7 +2045,16 @@
         });
       });
 
-      document.getElementById("footerSyncBtn").addEventListener("click", () => syncFromServer(true));
+      document.getElementById("footerSyncBtn").addEventListener("click", () => syncFromServer(true, true));
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible" && getApiUrl() && Date.now() - state.lastSyncTimestamp > 20000) {
+          syncFromServer(false, true);
+        }
+      });
+      window.addEventListener("online", () => {
+        if (getApiUrl()) syncFromServer(false, true);
+      });
       document.getElementById("footerRosterBtn").addEventListener("click", openRosterSheet);
       document.getElementById("footerPastToggleBtn").addEventListener("click", () => {
         state.showPast = !state.showPast;
