@@ -952,10 +952,16 @@
       selectedMonth: "Nov 2026",
       selectedParent: localStorage.getItem(STORAGE_KEYS.PARENT_NAME) || "",
       showPast: false,
-      syncStatus: "idle", // "idle" | "syncing" | "synced" | "error"
+      syncStatus: "idle", // "idle" | "syncing" | "saving" | "synced" | "error"
       lastSyncTimestamp: 0,
-      syncInFlight: false
+      syncInFlight: false,
+      syncGeneration: 0,
+      syncAbortController: null,
+      pendingMutations: 0,
+      activityReqId: 0
     };
+
+    let mutationChain = Promise.resolve();
 
     function getApiUrl() {
       const override = localStorage.getItem(STORAGE_KEYS.API_URL_OVERRIDE);
@@ -1029,11 +1035,15 @@
       const txt = document.getElementById("headerSyncText");
       if (!btn || !dot || !txt) return;
 
-      btn.classList.toggle("is-syncing", state.syncStatus === "syncing");
-      dot.className = "sync-dot" + (state.syncStatus !== "idle" ? ` ${state.syncStatus}` : "");
+      const isBusy = state.syncStatus === "syncing" || state.syncStatus === "saving";
+      btn.classList.toggle("is-syncing", isBusy);
+      const dotState = state.syncStatus === "saving" ? "syncing" : state.syncStatus;
+      dot.className = "sync-dot" + (dotState !== "idle" ? ` ${dotState}` : "");
 
       if (!getApiUrl()) {
         txt.textContent = "Not connected · Tap to configure";
+      } else if (state.syncStatus === "saving") {
+        txt.textContent = "Saving to Google Sheet…";
       } else if (state.syncStatus === "syncing") {
         txt.textContent = "Syncing with Google Sheet…";
       } else if (state.syncStatus === "synced" && state.lastSyncTimestamp) {
@@ -1045,6 +1055,14 @@
       }
     }
 
+    function abortInFlightSync() {
+      if (state.syncAbortController) {
+        try { state.syncAbortController.abort(); } catch (_) {}
+        state.syncAbortController = null;
+      }
+      state.syncInFlight = false;
+    }
+
     function mergeSingleMonth(monthObj) {
       if (!state.data || !Array.isArray(state.data.months) || !monthObj) return;
       const idx = state.data.months.findIndex(m => m.tabName === monthObj.tabName);
@@ -1053,14 +1071,25 @@
       localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
     }
 
-    async function syncFromServer(showFeedback, forceNoCache = showFeedback) {
+    async function syncFromServer(showFeedback, forceNoCache = showFeedback, forcePreempt = showFeedback) {
       const apiUrl = getApiUrl();
       if (!apiUrl) {
         if (showFeedback) openApiConfigSheet();
         renderSyncStatus();
         return;
       }
-      if (state.syncInFlight) return;
+      // Never let a background GET start while a write is actively saving
+      if (state.pendingMutations > 0 && !forcePreempt) return;
+
+      if (state.syncInFlight) {
+        if (!forcePreempt) return;
+        abortInFlightSync();
+      }
+
+      const gen = ++state.syncGeneration;
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const signal = controller ? controller.signal : undefined;
+      state.syncAbortController = controller;
       state.syncInFlight = true;
       state.syncStatus = "syncing";
       renderSyncStatus();
@@ -1070,8 +1099,9 @@
 
         if (!state.data) {
           // First-time load: fetch cached full workbook first (~2s) so the UI renders fast
-          const fastRes = await fetch(`${apiUrl}${sep}action=all`, { redirect: "follow" });
+          const fastRes = await fetch(`${apiUrl}${sep}action=all`, { redirect: "follow", signal });
           const fastJson = await fastRes.json();
+          if (gen !== state.syncGeneration) return;
           if (fastJson && fastJson.ok) {
             state.data = fastJson;
             state.lastSyncTimestamp = Date.now();
@@ -1084,9 +1114,10 @@
           // Then immediately verify the active month without cache (~1.7s)
           const monthRes = await fetch(
             `${apiUrl}${sep}action=month&month=${encodeURIComponent(state.selectedMonth)}&nocache=1`,
-            { redirect: "follow" }
+            { redirect: "follow", signal }
           );
           const monthJson = await monthRes.json();
+          if (gen !== state.syncGeneration) return;
           if (monthJson && monthJson.ok && monthJson.month) {
             mergeSingleMonth(monthJson.month);
           }
@@ -1102,20 +1133,23 @@
           try {
             const monthRes = await fetch(
               `${apiUrl}${sep}action=month&month=${encodeURIComponent(state.selectedMonth)}&nocache=1`,
-              { redirect: "follow" }
+              { redirect: "follow", signal }
             );
             const monthJson = await monthRes.json();
+            if (gen !== state.syncGeneration) return;
             if (monthJson && monthJson.ok && monthJson.month) {
               mergeSingleMonth(monthJson.month);
               renderAll();
             }
-          } catch (_) {
+          } catch (monthErr) {
+            if (monthErr && monthErr.name === "AbortError") return;
             // Fall through to full workbook fetch
           }
         }
 
-        const res = await fetch(`${apiUrl}${sep}action=all&nocache=1`, { redirect: "follow" });
+        const res = await fetch(`${apiUrl}${sep}action=all&nocache=1`, { redirect: "follow", signal });
         const json = await res.json();
+        if (gen !== state.syncGeneration) return;
         if (json && json.ok) {
           state.data = json;
           state.syncStatus = "synced";
@@ -1129,11 +1163,15 @@
           if (showFeedback) showToast("Could not refresh schedule", true);
         }
       } catch (err) {
+        if ((err && err.name === "AbortError") || gen !== state.syncGeneration) return;
         state.syncStatus = "error";
         renderAll();
         if (showFeedback) showToast("Could not reach server — using cached schedule", true);
       } finally {
-        state.syncInFlight = false;
+        if (state.syncAbortController === controller) {
+          state.syncAbortController = null;
+          state.syncInFlight = false;
+        }
       }
     }
 
@@ -1872,111 +1910,159 @@
         </form>
       `;
 
-      panel.querySelector("#footerForm").addEventListener("submit", async e => {
+      panel.querySelector("#footerForm").addEventListener("submit", e => {
         e.preventDefault();
         const newValue = document.getElementById("footerValInput").value.trim();
         dlg.close();
-        role.volunteer = newValue;
-        renderAll();
-
-        const apiUrl = getApiUrl();
-        if (!apiUrl) return;
-        try {
-          const res = await fetch(apiUrl, {
-            method: "POST",
-            headers: { "Content-Type": "text/plain;charset=utf-8" },
-            redirect: "follow",
-            body: JSON.stringify({
-              action: "FOOTER_EDIT",
-              month: monthName,
-              footerKey,
-              field: "volunteer",
-              expectedPreviousValue: currentVal,
-              newValue,
-              actorName: state.selectedParent || "Parent Volunteer"
-            })
-          });
-          const json = await res.json();
-          if (json && json.ok && json.month) {
-            const idx = state.data.months.findIndex(x => x.tabName === json.month.tabName);
-            if (idx !== -1) state.data.months[idx] = json.month;
-            state.syncStatus = "synced";
-            state.lastSyncTimestamp = Date.now();
-            localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
-            renderAll();
-            showToast("Saved to Google Sheet");
-          }
-        } catch (_) {
-          showToast("Error saving monthly role", true);
-        }
+        submitFooterMutation({
+          action: "FOOTER_EDIT",
+          month: monthName,
+          footerKey,
+          field: "volunteer",
+          expectedPreviousValue: currentVal,
+          newValue,
+          actorName: state.selectedParent || "Parent Volunteer"
+        });
       });
 
       if (!dlg.open) dlg.showModal();
     }
 
-    async function submitSlotMutation(payload, isUndo = false) {
+    function enqueueMutation(taskFn) {
+      state.pendingMutations += 1;
+      abortInFlightSync();
+      state.syncGeneration += 1;
+      state.syncStatus = "saving";
+      renderSyncStatus();
+
+      const run = async () => {
+        try {
+          await taskFn();
+        } finally {
+          state.pendingMutations = Math.max(0, state.pendingMutations - 1);
+          if (state.pendingMutations === 0 && state.syncStatus === "saving") {
+            state.syncStatus = state.lastSyncTimestamp ? "synced" : "idle";
+            renderSyncStatus();
+          }
+        }
+      };
+
+      mutationChain = mutationChain.then(run, run);
+      return mutationChain;
+    }
+
+    function restoreSnapshot(snapshotJson) {
+      state.data = JSON.parse(snapshotJson);
+      localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, snapshotJson);
+      renderAll();
+    }
+
+    function submitFooterMutation(payload) {
+      return enqueueMutation(async () => {
+        const snapshot = JSON.stringify(state.data);
+        const m = (state.data && state.data.months || []).find(x => x.tabName === payload.month);
+        const role = m && (m.footerRoles || []).find(r => r.footerKey === payload.footerKey);
+        if (role) role.volunteer = payload.newValue;
+        localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
+        renderAll();
+
+        const apiUrl = getApiUrl();
+        if (!apiUrl) {
+          showToast("Saved locally — connect Apps Script URL to sync to Google Sheet", true);
+          return;
+        }
+
+        try {
+          const res = await fetch(apiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            redirect: "follow",
+            body: JSON.stringify(payload)
+          });
+          const json = await res.json();
+          if (!json || !json.ok) {
+            restoreSnapshot(snapshot);
+            showToast((json && json.message) || "Could not save monthly role", true);
+            if (json && json.code === "CONFLICT") syncFromServer(true, true, true);
+            return;
+          }
+          if (json.month) mergeSingleMonth(json.month);
+          state.syncGeneration += 1;
+          state.syncStatus = "synced";
+          state.lastSyncTimestamp = Date.now();
+          renderAll();
+          showToast("Saved to Google Sheet");
+        } catch (_) {
+          restoreSnapshot(snapshot);
+          showToast("Error saving monthly role", true);
+        }
+      });
+    }
+
+    function submitSlotMutation(payload, isUndo = false) {
       const dlg = document.getElementById("actionSheet");
       if (dlg && dlg.open) dlg.close();
 
-      const foundBefore = findDayAndSlot(payload.month, payload.colIndex, payload.roleKey);
-      const prevVolunteerRaw = foundBefore && foundBefore.slot ? (foundBefore.slot.volunteer || "") : "";
+      return enqueueMutation(async () => {
+        const foundBefore = findDayAndSlot(payload.month, payload.colIndex, payload.roleKey);
+        const prevVolunteerRaw = foundBefore && foundBefore.slot ? (foundBefore.slot.volunteer || "") : "";
 
-      const snapshot = JSON.stringify(state.data);
-      applyOptimisticChange(payload);
-      localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
-      renderAll();
+        const snapshot = JSON.stringify(state.data);
+        applyOptimisticChange(payload);
+        localStorage.setItem(STORAGE_KEYS.SCHEDULE_CACHE, JSON.stringify(state.data));
+        renderAll();
 
-      const apiUrl = getApiUrl();
-      if (!apiUrl) {
-        showToast("Saved locally — connect Apps Script URL to sync to Google Sheet", true);
-        return;
-      }
-
-      try {
-        const res = await fetch(apiUrl, {
-          method: "POST",
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
-          redirect: "follow",
-          body: JSON.stringify(payload)
-        });
-        const result = await res.json();
-        if (!result || !result.ok) {
-          state.data = JSON.parse(snapshot);
-          renderAll();
-          showToast((result && result.message) || "Could not save change", true);
-          if (result && result.code === "CONFLICT") syncFromServer(true);
+        const apiUrl = getApiUrl();
+        if (!apiUrl) {
+          showToast("Saved locally — connect Apps Script URL to sync to Google Sheet", true);
           return;
         }
-        if (result.month) {
-          mergeSingleMonth(result.month);
-        }
-        state.syncStatus = "synced";
-        state.lastSyncTimestamp = Date.now();
-        renderAll();
 
-        let undoFn = null;
-        if (!isUndo && ["CLAIM", "CLEAR", "DIRECT", "SUB"].includes(payload.action)) {
-          const currentAfter = payload.action === "CLEAR" ? "" : (payload.newVolunteer || "");
-          undoFn = () => {
-            const undoActionType = prevVolunteerRaw ? (payload.action === "CLEAR" ? "CLAIM" : "DIRECT") : "CLEAR";
-            submitSlotMutation({
-              action: undoActionType,
-              month: payload.month,
-              colIndex: payload.colIndex,
-              roleKey: payload.roleKey,
-              expectedPreviousValue: currentAfter,
-              newVolunteer: prevVolunteerRaw,
-              actorName: payload.actorName,
-              comment: "Undo previous change"
-            }, true);
-          };
+        try {
+          const res = await fetch(apiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            redirect: "follow",
+            body: JSON.stringify(payload)
+          });
+          const result = await res.json();
+          if (!result || !result.ok) {
+            restoreSnapshot(snapshot);
+            showToast((result && result.message) || "Could not save change", true);
+            if (result && result.code === "CONFLICT") syncFromServer(true, true, true);
+            return;
+          }
+          if (result.month) {
+            mergeSingleMonth(result.month);
+          }
+          state.syncGeneration += 1;
+          state.syncStatus = "synced";
+          state.lastSyncTimestamp = Date.now();
+          renderAll();
+
+          let undoFn = null;
+          if (!isUndo && ["CLAIM", "CLEAR", "DIRECT", "SUB"].includes(payload.action)) {
+            const currentAfter = payload.action === "CLEAR" ? "" : (payload.newVolunteer || "");
+            undoFn = () => {
+              const undoActionType = prevVolunteerRaw ? (payload.action === "CLEAR" ? "CLAIM" : "DIRECT") : "CLEAR";
+              submitSlotMutation({
+                action: undoActionType,
+                month: payload.month,
+                colIndex: payload.colIndex,
+                roleKey: payload.roleKey,
+                expectedPreviousValue: currentAfter,
+                newVolunteer: prevVolunteerRaw,
+                actorName: payload.actorName,
+                comment: "Undo previous change"
+              }, true);
+            };
+          }
+          showToast(isUndo ? "Undone in Google Sheet" : "Saved to Google Sheet", false, undoFn);
+        } catch (err) {
+          restoreSnapshot(snapshot);
+          showToast("Network error while saving", true);
         }
-        showToast(isUndo ? "Undone in Google Sheet" : "Saved to Google Sheet", false, undoFn);
-      } catch (err) {
-        state.data = JSON.parse(snapshot);
-        renderAll();
-        showToast("Network error while saving", true);
-      }
+      });
     }
 
     function applyOptimisticChange(payload) {
@@ -1994,7 +2080,7 @@
         slot.volunteer = payload.newVolunteer;
         const subNote = prev ? `${payload.newVolunteer} subbing for ${prev} (${shortRole})` : `${payload.newVolunteer} claimed ${shortRole}`;
         day.notes = day.notes ? `${day.notes} | ${subNote}` : subNote;
-      } else if (payload.action === "CLAIM") {
+      } else if (payload.action === "CLAIM" || payload.action === "DIRECT") {
         slot.volunteer = payload.newVolunteer;
       } else if (payload.action === "CLEAR") {
         slot.volunteer = "";
@@ -2207,10 +2293,12 @@
         return;
       }
 
+      const reqId = ++state.activityReqId;
       try {
         const sep = apiUrl.includes("?") ? "&" : "?";
         const res = await fetch(`${apiUrl}${sep}action=activity&limit=20`, { redirect: "follow" });
         const json = await res.json();
+        if (reqId !== state.activityReqId || document.getElementById("activityBody") !== body) return;
         if (!json || !json.ok || !Array.isArray(json.entries)) {
           body.innerHTML = `<p style="margin: 0;">Redeploy <code>Code.gs</code> in Apps Script to enable the live Recent Changes feed.</p>`;
           return;
@@ -2346,6 +2434,17 @@
       });
       window.addEventListener("online", () => {
         if (getApiUrl()) syncFromServer(false, true);
+      });
+      window.addEventListener("storage", e => {
+        if (e.key === STORAGE_KEYS.SCHEDULE_CACHE && e.newValue && state.pendingMutations === 0) {
+          try {
+            state.data = JSON.parse(e.newValue);
+            renderAll();
+          } catch (_) {}
+        } else if (e.key === STORAGE_KEYS.PARENT_NAME) {
+          state.selectedParent = e.newValue || "";
+          renderAll();
+        }
       });
       document.getElementById("footerRosterBtn").addEventListener("click", openRosterSheet);
       document.getElementById("footerPastToggleBtn").addEventListener("click", () => {
