@@ -72,6 +72,15 @@ function doGet(e) {
       return createJsonResponse({ ok: true, schema: report });
     }
 
+    if (action === "activity") {
+      var limit = Math.min(Math.max(Number(params.limit) || 20, 1), 50);
+      return createJsonResponse({
+        ok: true,
+        serverTime: new Date().toISOString(),
+        entries: getRecentActivity_(limit)
+      });
+    }
+
     if (action === "month" && params.month) {
       var ss = getWorkbook_();
       var monthData = getMonthDataCached_(ss, params.month, forceRefresh);
@@ -184,6 +193,25 @@ function handleSheetEdit(e) {
   } catch (err) {
     Logger.log("handleSheetEdit warning: " + err);
   }
+}
+
+/**
+ * Run once in the Apps Script editor to install the onEdit cache-invalidation trigger.
+ * Safe to re-run: avoids creating duplicate triggers.
+ */
+function setupOnEditTrigger() {
+  var ss = getWorkbook_();
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "handleSheetEdit") {
+      return { ok: true, alreadyInstalled: true };
+    }
+  }
+  ScriptApp.newTrigger("handleSheetEdit")
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+  return { ok: true, installed: true };
 }
 
 /**
@@ -1084,6 +1112,34 @@ function appendAuditLogRow_(ss, entry) {
   } catch (err) {
     Logger.log("Failed to append audit log row: " + err);
   }
+}
+
+function getRecentActivity_(limit) {
+  var ss = getWorkbook_();
+  var auditSheet = ss.getSheetByName(CONFIG.AUDIT_LOG_TAB);
+  if (!auditSheet) return [];
+  var lastRow = auditSheet.getLastRow();
+  if (lastRow <= 1) return [];
+  var count = Math.min(limit || 20, lastRow - 1);
+  var startRow = lastRow - count + 1;
+  var rows = auditSheet.getRange(startRow, 1, count, 10).getDisplayValues();
+  var out = [];
+  for (var i = rows.length - 1; i >= 0; i--) {
+    var r = rows[i];
+    out.push({
+      timestamp: r[0] || "",
+      month: r[1] || "",
+      dateLabel: r[2] || "",
+      roleLabel: r[3] || "",
+      cellA1: r[4] || "",
+      actionType: r[5] || "",
+      previousValue: r[6] || "",
+      newValue: r[7] || "",
+      actorName: r[8] || "",
+      comment: r[9] || ""
+    });
+  }
+  return out;
 }
 
 // ============================================================================
