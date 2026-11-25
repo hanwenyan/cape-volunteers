@@ -1196,11 +1196,17 @@
 
     function doesSlotNeedSub(day, slot) {
       if (!slot || !slot.editable || slot.isNA) return false;
-      const notes = (day.notes || "").toLowerCase();
-      if (!notes.includes("sub needed")) return false;
+      const notes = day.notes || "";
+      if (!/sub\s+needed/i.test(notes)) return false;
       const vol = cleanDisplayVolunteer(slot.volunteer).toLowerCase();
       const shortRole = (slot.shortLabel || "").toLowerCase();
-      return (vol && notes.includes(vol)) || (shortRole && notes.includes(shortRole));
+      // Check each pipe/newline-delimited note segment individually to prevent cross-slot false positives
+      const segments = notes.split(/\s*\|\s*|\r?\n/);
+      return segments.some(seg => {
+        const s = seg.toLowerCase();
+        if (!s.includes("sub needed")) return false;
+        return (vol && s.includes(vol)) || (shortRole && s.includes(shortRole));
+      });
     }
 
     function isDayScheduled(day) {
@@ -1297,7 +1303,10 @@
 
       // Update mode tabs & counts
       document.querySelectorAll("[data-filter-mode]").forEach(btn => {
-        btn.classList.toggle("active", btn.dataset.filterMode === state.mode);
+        const isActive = btn.dataset.filterMode === state.mode;
+        btn.classList.toggle("active", isActive);
+        if (isActive) btn.setAttribute("aria-current", "page");
+        else btn.removeAttribute("aria-current");
       });
 
       const { myShifts, openOrSubSlots } = findAllUpcomingShifts();
@@ -1319,6 +1328,10 @@
         main.innerHTML = renderOpenMode(openOrSubSlots);
       } else {
         main.innerHTML = renderScheduleMode(myShifts);
+        const activeMonthPill = main.querySelector(".month-pill.active");
+        if (activeMonthPill && typeof activeMonthPill.scrollIntoView === "function") {
+          activeMonthPill.scrollIntoView({ inline: "center", block: "nearest" });
+        }
       }
     }
 
@@ -1460,7 +1473,7 @@
       const slots = getVisibleSlots(day);
       const centersSlots = slots.filter(s => s.roleKey.startsWith("centers"));
       const homeworkSlot = slots.find(s => s.roleKey === "homework");
-      const openCount = slots.filter(s => !cleanDisplayVolunteer(s.volunteer)).length;
+      const openCount = day.isExtraDetails ? 0 : slots.filter(s => !cleanDisplayVolunteer(s.volunteer)).length;
 
       let statusBadgeHtml = "";
       if (openCount > 0) {
@@ -1603,7 +1616,8 @@
         return `
           <div class="empty-state">
             <p style="font-weight: 700; margin: 0 0 6px;">No upcoming shifts for ${escapeHtml(state.selectedParent)}</p>
-            <p style="font-size: 0.84rem; color: var(--ink-secondary); margin: 0;">Check the Needs Help tab to claim an open slot.</p>
+            <p style="font-size: 0.84rem; color: var(--ink-secondary); margin: 0 0 14px;">Check Needs Help to claim an open slot or cover for another parent.</p>
+            <button type="button" class="primary-cta" data-action="goto-open" style="max-width: 220px;">See Open Shifts</button>
           </div>
         `;
       }
@@ -1723,11 +1737,7 @@
       const dlg = document.getElementById("actionSheet");
       const panel = document.getElementById("actionSheetPanel");
 
-      const parentOptions = (state.data.parentDirectory || [])
-        .map(p => `<option value="${escapeAttr(p)}">${escapeHtml(p)}</option>`)
-        .join("");
-
-      // CASE 1: It's YOUR shift (and you haven't clicked "Record someone covering for me" yet)
+      // CASE 1: It's YOUR shift (and you haven't clicked "Someone else is covering" yet)
       if (isMine && !forceSwapView) {
         panel.innerHTML = `
           <div class="sheet-handle"></div>
@@ -1736,13 +1746,23 @@
               <h3 class="sheet-title">Your Shift · ${escapeHtml(day.dayOfWeek)} ${escapeHtml(day.dateDisplay)}</h3>
               <div class="sheet-subtitle">${escapeHtml(slot.roleLabel)} (${escapeHtml(slot.timeWindow)})</div>
             </div>
-            <button type="button" class="close-btn" data-action="close-sheet">✕</button>
+            <button type="button" class="close-btn" data-action="close-sheet" aria-label="Close">✕</button>
           </div>
 
           <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 10px;">
-            <button type="button" class="primary-cta" id="oneTapNeedSubBtn">
-              Flag “I Need a Sub” for This Day
-            </button>
+            ${subNeeded ? `
+              <button type="button" class="primary-cta" id="cancelSubBtn">
+                Cancel Sub Request (I Can Make It)
+              </button>
+            ` : `
+              <div class="form-field" style="margin-bottom: 2px;">
+                <label class="form-label" for="needSubNoteInput">Optional Note for Other Parents</label>
+                <input type="text" id="needSubNoteInput" class="form-input" placeholder="e.g., Out of town — happy to trade another day" />
+              </div>
+              <button type="button" class="primary-cta" id="oneTapNeedSubBtn">
+                Flag “I Need a Sub” for This Day
+              </button>
+            `}
             <button type="button" class="secondary-cta" id="switchToSwapFormBtn">
               Someone Else Is Already Covering for Me…
             </button>
@@ -1756,18 +1776,38 @@
           </div>
         `;
 
-        panel.querySelector("#oneTapNeedSubBtn").addEventListener("click", () => {
-          submitSlotMutation({
-            action: "NEED_SUB",
-            month: day.month,
-            colIndex: day.colIndex,
-            roleKey: slot.roleKey,
-            expectedPreviousValue: rawCurrent,
-            newVolunteer: rawCurrent,
-            actorName: state.selectedParent,
-            comment: ""
+        const needSubBtn = panel.querySelector("#oneTapNeedSubBtn");
+        if (needSubBtn) {
+          needSubBtn.addEventListener("click", () => {
+            const noteEl = document.getElementById("needSubNoteInput");
+            submitSlotMutation({
+              action: "NEED_SUB",
+              month: day.month,
+              colIndex: day.colIndex,
+              roleKey: slot.roleKey,
+              expectedPreviousValue: rawCurrent,
+              newVolunteer: rawCurrent,
+              actorName: state.selectedParent,
+              comment: noteEl ? noteEl.value.trim() : ""
+            });
           });
-        });
+        }
+
+        const cancelSubBtn = panel.querySelector("#cancelSubBtn");
+        if (cancelSubBtn) {
+          cancelSubBtn.addEventListener("click", () => {
+            submitSlotMutation({
+              action: "CANCEL_SUB",
+              month: day.month,
+              colIndex: day.colIndex,
+              roleKey: slot.roleKey,
+              expectedPreviousValue: rawCurrent,
+              newVolunteer: rawCurrent,
+              actorName: state.selectedParent,
+              comment: ""
+            });
+          });
+        }
 
         panel.querySelector("#switchToSwapFormBtn").addEventListener("click", () => {
           openContextSlotSheet(monthName, colIndex, roleKey, true);
@@ -1777,7 +1817,50 @@
         return;
       }
 
-      // CASE 2: Open slot, Sub Needed slot, or covering for another parent
+      // CASE 1B: 1-Tap Claim for an OPEN slot when the user has already picked their name
+      if (isEmpty && state.selectedParent && !forceSwapView) {
+        panel.innerHTML = `
+          <div class="sheet-handle"></div>
+          <div class="sheet-header">
+            <div>
+              <h3 class="sheet-title">Claim Open Shift</h3>
+              <div class="sheet-subtitle">${escapeHtml(day.dayOfWeek)} ${escapeHtml(day.dateDisplay)} · ${escapeHtml(slot.roleLabel)} (${escapeHtml(slot.timeWindow)})</div>
+            </div>
+            <button type="button" class="close-btn" data-action="close-sheet" aria-label="Close">✕</button>
+          </div>
+
+          <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 10px;">
+            <button type="button" class="primary-cta" id="oneTapClaimBtn">
+              Claim Shift as ${escapeHtml(state.selectedParent)}
+            </button>
+            <button type="button" class="secondary-cta" id="claimForOtherBtn">
+              Sign Up Someone Else / Add Note…
+            </button>
+          </div>
+        `;
+
+        panel.querySelector("#oneTapClaimBtn").addEventListener("click", () => {
+          submitSlotMutation({
+            action: "CLAIM",
+            month: day.month,
+            colIndex: day.colIndex,
+            roleKey: slot.roleKey,
+            expectedPreviousValue: rawCurrent,
+            newVolunteer: state.selectedParent,
+            actorName: state.selectedParent,
+            comment: ""
+          });
+        });
+
+        panel.querySelector("#claimForOtherBtn").addEventListener("click", () => {
+          openContextSlotSheet(monthName, colIndex, roleKey, true);
+        });
+
+        if (!dlg.open) dlg.showModal();
+        return;
+      }
+
+      // CASE 2: Open slot (guest / other person), Sub Needed slot, or covering for another parent
       const heading = isEmpty
         ? `Claim Open Shift`
         : (subNeeded ? `Cover Sub for ${displayCurrent}` : `Cover or Swap with ${displayCurrent}`);
@@ -1789,7 +1872,7 @@
             <h3 class="sheet-title">${escapeHtml(heading)}</h3>
             <div class="sheet-subtitle">${escapeHtml(day.dayOfWeek)} ${escapeHtml(day.dateDisplay)} · ${escapeHtml(slot.roleLabel)} (${escapeHtml(slot.timeWindow)})</div>
           </div>
-          <button type="button" class="close-btn" data-action="close-sheet">✕</button>
+          <button type="button" class="close-btn" data-action="close-sheet" aria-label="Close">✕</button>
         </div>
 
         <form id="simpleCoverForm" style="margin-top: 14px;">
@@ -1800,7 +1883,7 @@
               value="${escapeAttr(state.selectedParent && !isParentMatch(rawCurrent, state.selectedParent) ? state.selectedParent : "")}"
               required />
             <datalist id="parentList">
-              ${(state.data.parentDirectory || []).map(p => `<option value="${escapeAttr(p)}"></option>`).join("")}
+              ${((state.data && state.data.parentDirectory) || []).map(p => `<option value="${escapeAttr(p)}"></option>`).join("")}
             </datalist>
           </div>
 
@@ -1814,10 +1897,12 @@
           </button>
 
           ${!isEmpty ? `
-            <div style="margin-top: 12px; display: flex; justify-content: space-between; font-size: 0.78rem;">
-              <button type="button" id="flagSubForOtherBtn" style="color: var(--cape-maroon); font-weight: 700; text-decoration: underline;">
-                Flag that ${escapeHtml(displayCurrent)} needs a sub
-              </button>
+            <div style="margin-top: 12px; display: flex; justify-content: space-between; font-size: 0.78rem; gap: 10px;">
+              ${!subNeeded ? `
+                <button type="button" id="flagSubForOtherBtn" style="color: var(--cape-maroon); font-weight: 700; text-decoration: underline;">
+                  Flag that ${escapeHtml(displayCurrent)} needs a sub
+                </button>
+              ` : `<span></span>`}
               <button type="button" id="clearSlotLinkBtn" style="color: var(--ink-tertiary); text-decoration: underline;">
                 Mark slot open
               </button>
@@ -1831,6 +1916,11 @@
         const newVol = document.getElementById("coverParentSelect").value.trim();
         const comment = document.getElementById("coverNoteInput").value.trim();
         if (!newVol) return;
+
+        if (!isEmpty && isParentMatch(rawCurrent, newVol)) {
+          showToast(`${displayCurrent} is already assigned to this shift`, true);
+          return;
+        }
 
         if (!state.selectedParent) saveParentIdentity(newVol);
 
@@ -1864,7 +1954,15 @@
 
       const clearBtn = panel.querySelector("#clearSlotLinkBtn");
       if (clearBtn) {
+        let armed = false;
         clearBtn.addEventListener("click", () => {
+          if (!armed) {
+            armed = true;
+            clearBtn.textContent = "Tap again to confirm clearing";
+            clearBtn.style.color = "var(--cape-maroon)";
+            clearBtn.style.fontWeight = "700";
+            return;
+          }
           submitSlotMutation({
             action: "CLEAR",
             month: day.month,
@@ -1904,7 +2002,12 @@
         <form id="footerForm" style="margin-top: 14px;">
           <div class="form-field">
             <label class="form-label" for="footerValInput">Volunteer / Presentation Entry</label>
-            <input type="text" id="footerValInput" class="form-input" value="${escapeAttr(currentVal || state.selectedParent || "")}" />
+            <input type="text" id="footerValInput" class="form-input" list="footerParentList"
+              placeholder="Select or type name (leave blank to clear)"
+              value="${escapeAttr(currentVal || state.selectedParent || "")}" />
+            <datalist id="footerParentList">
+              ${((state.data && state.data.parentDirectory) || []).map(p => `<option value="${escapeAttr(p)}"></option>`).join("")}
+            </datalist>
           </div>
           <button type="submit" class="primary-cta">Save Monthly Role</button>
         </form>
@@ -2028,7 +2131,10 @@
           const result = await res.json();
           if (!result || !result.ok) {
             restoreSnapshot(snapshot);
-            showToast((result && result.message) || "Could not save change", true);
+            const msg = (result && result.code === "UNKNOWN_ACTION" && payload.action === "CANCEL_SUB")
+              ? "Redeploy Code.gs in Apps Script to cancel sub flags from the app"
+              : ((result && result.message) || "Could not save change");
+            showToast(msg, true);
             if (result && result.code === "CONFLICT") syncFromServer(true, true, true);
             return;
           }
@@ -2076,6 +2182,20 @@
         const holder = prev || payload.actorName;
         const flag = `SUB NEEDED for ${holder} (${shortRole})` + (payload.comment ? ` - ${payload.comment}` : "");
         day.notes = day.notes ? `${day.notes} | ${flag}` : flag;
+      } else if (payload.action === "CANCEL_SUB") {
+        const volLower = prev.toLowerCase();
+        const roleLower = shortRole.toLowerCase();
+        day.notes = (day.notes || "")
+          .split(/\s*\|\s*/)
+          .filter(seg => {
+            const s = seg.trim().toLowerCase();
+            if (!s) return false;
+            if (s.includes("sub needed") && ((volLower && s.includes(volLower)) || (roleLower && s.includes(roleLower)))) {
+              return false;
+            }
+            return true;
+          })
+          .join(" | ");
       } else if (payload.action === "SUB") {
         slot.volunteer = payload.newVolunteer;
         const subNote = prev ? `${payload.newVolunteer} subbing for ${prev} (${shortRole})` : `${payload.newVolunteer} claimed ${shortRole}`;
@@ -2094,7 +2214,7 @@
     function openIdentitySheet() {
       const dlg = document.getElementById("actionSheet");
       const panel = document.getElementById("actionSheetPanel");
-      const parents = state.data.parentDirectory || [];
+      const parents = (state.data && state.data.parentDirectory) || [];
 
       panel.innerHTML = `
         <div class="sheet-handle"></div>
@@ -2103,23 +2223,30 @@
             <h3 class="sheet-title">Who are you?</h3>
             <div class="sheet-subtitle">Pick your name once to highlight your shifts all year.</div>
           </div>
-          <button type="button" class="close-btn" data-action="close-sheet">✕</button>
+          <button type="button" class="close-btn" data-action="close-sheet" aria-label="Close">✕</button>
         </div>
 
         <div style="margin-top: 12px; display: flex; flex-direction: column; gap: 6px; max-height: 52dvh; overflow-y: auto;">
-          ${parents.map(name => `
+          ${parents.length > 0 ? parents.map(name => `
             <button type="button" class="vol-chip ${state.selectedParent === name ? "is-mine" : ""}"
               data-pick-parent="${escapeAttr(name)}">
               <span>${escapeHtml(name)}</span>
               <span class="chip-right">${state.selectedParent === name ? "Selected ✓" : "Select"}</span>
             </button>
-          `).join("")}
+          `).join("") : `<div style="font-size: 0.82rem; color: var(--ink-tertiary); padding: 6px 2px;">Loading parent list… you can also type your name below.</div>`}
         </div>
 
         <form id="customNameForm" style="margin-top: 12px; display: flex; gap: 8px;">
           <input type="text" id="customNameInput" class="form-input" placeholder="Or type your full name…" />
           <button type="submit" class="primary-cta" style="width: auto; padding: 10px 14px;">Save</button>
         </form>
+        ${state.selectedParent ? `
+          <div style="margin-top: 10px; text-align: center;">
+            <button type="button" id="clearIdentityBtn" style="font-size: 0.78rem; color: var(--ink-tertiary); text-decoration: underline;">
+              Clear selection (browse as guest)
+            </button>
+          </div>
+        ` : ""}
       `;
 
       panel.querySelectorAll("[data-pick-parent]").forEach(btn => {
@@ -2137,6 +2264,15 @@
           dlg.close();
         }
       });
+
+      const clearIdBtn = panel.querySelector("#clearIdentityBtn");
+      if (clearIdBtn) {
+        clearIdBtn.addEventListener("click", () => {
+          saveParentIdentity("");
+          showToast("Cleared selected name");
+          dlg.close();
+        });
+      }
 
       if (!dlg.open) dlg.showModal();
     }
@@ -2187,18 +2323,8 @@
       `;
 
       panel.querySelector("#dlIcsBtn").addEventListener("click", () => {
-        const ics = [
-          "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT",
-          `DTSTART;TZID=America/Los_Angeles:${dCompact}T${sCompact}`,
-          `DTEND;TZID=America/Los_Angeles:${dCompact}T${eCompact}`,
-          `SUMMARY:${title}`, "LOCATION:CAPE - Mrs. White's Classroom",
-          "END:VEVENT", "END:VCALENDAR"
-        ].join("\r\n");
-        const blob = new Blob([ics], { type: "text/calendar;charset=utf-8" });
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = `CAPE_Volunteer_${dCompact}.ics`;
-        a.click();
+        const ics = buildIcsContent([{ day, slot }]);
+        downloadIcsFile(ics, `CAPE_Volunteer_${dCompact}.ics`);
         dlg.close();
       });
 
@@ -2213,15 +2339,7 @@
         .replace(/;/g, "\\;");
     }
 
-    function exportAllMyShiftsIcs() {
-      if (!state.data || !state.selectedParent) return;
-      const { myShifts } = findAllUpcomingShifts();
-      const validShifts = myShifts.filter(({ day }) => day && day.isoDate);
-      if (validShifts.length === 0) {
-        showToast("No upcoming dated shifts to export", true);
-        return;
-      }
-
+    function buildIcsContent(shifts) {
       const nowUtc = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
       const lines = [
         "BEGIN:VCALENDAR",
@@ -2232,7 +2350,7 @@
         "X-WR-TIMEZONE:America/Los_Angeles"
       ];
 
-      validShifts.forEach(({ day, slot }) => {
+      shifts.forEach(({ day, slot }) => {
         const dCompact = day.isoDate.replace(/-/g, "");
         const sCompact = (slot.startTime || "08:15").replace(":", "") + "00";
         const eCompact = (slot.endTime || "09:45").replace(":", "") + "00";
@@ -2258,12 +2376,31 @@
       });
 
       lines.push("END:VCALENDAR");
-      const blob = new Blob([lines.join("\r\n")], { type: "text/calendar;charset=utf-8" });
+      return lines.join("\r\n");
+    }
+
+    function downloadIcsFile(icsText, filename) {
+      const blob = new Blob([icsText], { type: "text/calendar;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      const safeName = state.selectedParent.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "") || "Schedule";
-      a.download = `CAPE_Volunteers_${safeName}.ics`;
+      a.href = url;
+      a.download = filename;
       a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+
+    function exportAllMyShiftsIcs() {
+      if (!state.data || !state.selectedParent) return;
+      const { myShifts } = findAllUpcomingShifts();
+      const validShifts = myShifts.filter(({ day }) => day && day.isoDate);
+      if (validShifts.length === 0) {
+        showToast("No upcoming dated shifts to export", true);
+        return;
+      }
+
+      const ics = buildIcsContent(validShifts);
+      const safeName = state.selectedParent.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "") || "Schedule";
+      downloadIcsFile(ics, `CAPE_Volunteers_${safeName}.ics`);
       showToast(`Downloaded ${validShifts.length} shift${validShifts.length === 1 ? "" : "s"} (.ics)`);
     }
 
@@ -2344,7 +2481,9 @@
     function openRosterSheet() {
       const dlg = document.getElementById("actionSheet");
       const panel = document.getElementById("actionSheetPanel");
-      const entries = (state.data && state.data.roster && state.data.roster.entries) || [];
+      const rawEntries = (state.data && state.data.roster && state.data.roster.entries) || [];
+      const entries = rawEntries.filter(r => r && (r.volunteer || "").trim() !== "");
+      const footnotes = rawEntries.filter(r => r && !(r.volunteer || "").trim() && (r.role || "").trim() !== "");
 
       panel.innerHTML = `
         <div class="sheet-handle"></div>
@@ -2353,16 +2492,21 @@
             <h3 class="sheet-title">Original Sign-Ups</h3>
             <div class="sheet-subtitle">Baseline recurring schedule from ParentSquare</div>
           </div>
-          <button type="button" class="close-btn" data-action="close-sheet">✕</button>
+          <button type="button" class="close-btn" data-action="close-sheet" aria-label="Close">✕</button>
         </div>
-        <div style="margin-top: 10px; max-height: 55dvh; overflow-y: auto; border: 1px solid var(--border-hairline); border-radius: 10px;">
-          ${entries.map(r => `
+        <div style="margin-top: 10px; max-height: 52dvh; overflow-y: auto; border: 1px solid var(--border-hairline); border-radius: 10px;">
+          ${entries.length > 0 ? entries.map(r => `
             <div style="padding: 8px 12px; border-bottom: 1px solid var(--border-hairline); font-size: 0.82rem;">
               <div style="font-weight: 700;">${escapeHtml(cleanDisplayVolunteer(r.volunteer))}</div>
-              <div style="color: var(--ink-secondary);">${escapeHtml(r.day)} · ${escapeHtml(r.role)} (${escapeHtml(r.time)})</div>
+              <div style="color: var(--ink-secondary);">${escapeHtml(r.day)} · ${escapeHtml(r.role)}${r.time && r.time !== "-" ? ` (${escapeHtml(r.time)})` : ""}</div>
             </div>
-          `).join("")}
+          `).join("") : `<div style="padding: 12px; font-size: 0.82rem; color: var(--ink-tertiary);">Loading original sign-ups…</div>`}
         </div>
+        ${footnotes.length > 0 ? `
+          <p style="margin: 8px 2px 0; font-size: 0.74rem; color: var(--ink-tertiary); line-height: 1.35;">
+            ${footnotes.map(f => escapeHtml(f.role)).join(" ")}
+          </p>
+        ` : ""}
       `;
       if (!dlg.open) dlg.showModal();
     }
@@ -2478,6 +2622,9 @@
           openCalendarSheet(el.dataset.month, Number(el.dataset.col), el.dataset.role);
         } else if (act === "export-all-ics") {
           exportAllMyShiftsIcs();
+        } else if (act === "goto-open") {
+          state.mode = "open";
+          renderAll();
         } else if (act === "retry-sync") {
           syncFromServer(true, true);
         } else if (act === "close-sheet") {

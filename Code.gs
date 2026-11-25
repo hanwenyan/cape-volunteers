@@ -911,6 +911,16 @@ function processWriteMutation_(payload) {
         sheet.getRange(rm.notes, colIndex).setValue(updatedNotesVal);
       }
       auditComment = subFlagText;
+    } else if (action === "CANCEL_SUB") {
+      // Remove SUB NEEDED flag for this volunteer/role while keeping the volunteer assigned
+      if (rm.notes && currentVal) {
+        var clearedSubNotes = removeSubNeededFlagFor_(updatedNotesVal, currentVal, shortRoleName_(roleKey));
+        if (clearedSubNotes !== updatedNotesVal) {
+          updatedNotesVal = clearedSubNotes;
+          sheet.getRange(rm.notes, colIndex).setValue(updatedNotesVal);
+        }
+      }
+      auditComment = userComment || ("Cancelled sub request for " + (currentVal || actorName) + " (" + shortRoleName_(roleKey) + ")");
     } else if (action === "SUB") {
       if (!newVolunteer) {
         return { ok: false, code: "MISSING_VOLUNTEER", message: "Please select or enter the substitute volunteer's name." };
